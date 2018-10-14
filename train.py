@@ -1,11 +1,7 @@
 import gym
 import numpy as np
 import math
-
-# import numpy as np
-# import gym
-# import multiprocessing as mp
-# import time
+import copy
 
 '''
 
@@ -25,12 +21,12 @@ Inspired by:
 
 class MountainCarSolver:
 
-	def __init__(self, generations=2500):
+	def __init__(self, generations=1000):
 		# Load MountainCar
 		self.env = gym.make('MountainCar-v0')
 
 		# Learning rate
-		self.learningRate = 0.5
+		self.learningRate = 0.05
 
 		# Exploration rate (mutations)
 		self.explorationRate = 0.5
@@ -52,21 +48,30 @@ class MountainCarSolver:
 		# Number of kids per generation
 		# ---
 		# Kids replace individuals which did not survive the previous generation
-		# Kids are copies of the best performing individuals with few mutations.
+		# half of the kids are copies of the best performing individuals with few mutations,
+		# the other half are new random individuals
 		# This allows to quickly explore the feature space, while 
 		# encouraging best performing individual to last, and less performing to evolve
-		self.kidsPerGeneration = 4
+		self.kidsPerGeneration = 10
+
+		# Network shape
+		# - number of inputs
+		# - number of neurons in hidden layer
+		# - number of neurons in hidden layer
+		# - number of outputs 
+		self.networkShape = (
+			len(self.env.observation_space.high), 
+			20,
+			10,
+			5,
+			self.env.action_space.n
+		)
 
 		# Create initial population
 		# ---
 		# Each individual is a randomly generated feed forward neural net
 		# An individual role is to select the best `action` given an `observation`
-		self.population = [Individual((
-			len(self.env.observation_space.high), 
-			30,
-			20,
-			self.env.action_space.n
-		)) for i in range(self.populationSize)]
+		self.population = [Individual(self.networkShape) for i in range(self.populationSize)]
 
 		# Start training
 		self.run()
@@ -77,6 +82,8 @@ class MountainCarSolver:
 
 		# Loop through generations
 		for i in range(self.generations):
+			finished = 0
+			best = -200
 
 			# Loop through individuals
 			for individual in self.population:
@@ -96,6 +103,10 @@ class MountainCarSolver:
 					# retrieve current action reward and new state
 					new_state, reward, done, info = self.env.step(action)
 
+					# Rewards are -1 when goal is not reached and 1 when goal is reached
+					# Reward is given far too late to be able to learn only from that
+					# As we want to explore the space quickly, let's consider car momentum 
+					# as a kind of reward
 					if new_state[0] > -0.1: 
 						reward = 0.
 
@@ -104,24 +115,62 @@ class MountainCarSolver:
 					# Remember state
 					current_state = new_state
 
-					# break
+					# If game is solved before 200 steps
+					if done and step < 199:
+						finished += 1
+						break
 
 				# Set individual's reward
 				individual.reward(episode_reward)
 
-				if episode_reward > -200:
-					print episode_reward
+				# Remember best score
+				if episode_reward > best:
+					best = episode_reward
+
+			# When more than half of our population win the game,
+			# network is trained and best score is above 135
+			if finished > self.populationSize / 2 and (200 + best) > 135:
+				break
+
+			self.next_generation(i, finished)
 
 
-			self.next_generation()
+		# Training is finished
+		# Run the 10 best performing individuals
+		for i in range(10):
+			current_state = self.env.reset()
+			for step in range(200):
+				self.env.render()
+				action = self.population[0].forward(current_state)
+
+				# Run step with chosen action
+				new_state, reward, done, info = self.env.step(action)
+
+				current_state = new_state
+
+				if done:
+					break
 
 
-	def next_generation(self):
+	def next_generation(self, generation, finished):
 		def sort(e):
 			return e._reward
 
 		# sort population per reward
 		self.population.sort(key=sort, reverse=True)
+
+		for i in range(self.populationSize):
+			if i < self.populationSize - self.kidsPerGeneration:
+				self.population[i].evolve(((i + 1) / (self.populationSize - self.kidsPerGeneration) * self.learningRate))
+			else:
+				# Replace less performing individuals
+				if i % 2 == 0:
+					# Make children
+					self.population[i] = self.population[(self.populationSize - 1) - i].child(self.learningRate * 0.25)
+				else:
+					self.population[i] = Individual(self.networkShape)
+
+		print 'Generation', generation + 1, 'Best score', 200 + self.population[0]._reward, 'Finished', finished
 
 
 
@@ -135,13 +184,14 @@ Simple `fast forward` neural net implementation
 
 class Individual:
 	def __init__(self, shapes, layers=None):
+		self.shapes = shapes
 		self.layers = []
 		self._reward = 0
 
 		# Create layers
-		for i, shape in enumerate(shapes):
-			if i < len(shapes) - 1:
-				self.layers.append(self.layer(shapes[i], shapes[i + 1]))
+		for i, shape in enumerate(self.shapes):
+			if i < len(self.shapes) - 1:
+				self.layers.append(self.layer(self.shapes[i], self.shapes[i + 1]))
 
 		if layers:
 			self.layers = layers
@@ -165,8 +215,11 @@ class Individual:
 
 		# Forward X to layers
 		for i, layer in enumerate(self.layers):
+			# loop over each layer, except last
 			if i < len(self.layers) - 1:
 				x = np.tanh(x.dot(layer[0]) + layer[1])
+
+			# compute last layer
 			else:
 				x = x.dot(layer[0]) + layer[1]
 
@@ -174,12 +227,23 @@ class Individual:
 		return np.argmax(x, axis=1)[0]
 
 	# Evolve
-	def backprop(self, learningRate):
-		pass
+	def evolve(self, learningRate):
+		for i, shape in enumerate(self.shapes):
+			if i < len(self.shapes) - 1:
+				gradient = self.layer(self.shapes[i], self.shapes[i + 1])
+				self.layers[i][0] += gradient[0] * learningRate
+				self.layers[i][1] += gradient[1] * learningRate
+
 
 	# Save reward
 	def reward(self, reward=None):
 		self._reward = reward
+
+	# Make child
+	def child(self, learningRate):
+		child = Individual(self.shapes, copy.deepcopy(self.layers))
+		child.evolve(learningRate)
+		return child
 
 
 
